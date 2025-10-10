@@ -92,6 +92,9 @@ def list_bedrock_models() -> dict:
         - Application Inference Profiles (if enabled via Env)
     """
     model_list = {}
+    global claude_sonnet_4_5_app_profiles
+    # Clear and store application profiles for claude-sonnet-4-5 as an exception
+    claude_sonnet_4_5_app_profiles.clear()
     try:
         profile_list = []
         app_profile_dict = {}
@@ -125,6 +128,10 @@ def list_bedrock_models() -> dict:
                                 if model_id not in app_profile_dict:
                                     app_profile_dict[model_id] = []
                                 app_profile_dict[model_id].append(profile_arn)
+
+                                # Store application profiles for claude-sonnet-4-5 as exception
+                                if model_id == "anthropic.claude-sonnet-4-5-20250929-v1:0":
+                                    claude_sonnet_4_5_app_profiles.add(profile_arn)
                 except Exception as e:
                     logger.warning(f"Error processing application profile: {e}")
                     continue
@@ -173,6 +180,8 @@ def list_bedrock_models() -> dict:
 
     return model_list
 
+# Global variable to store claude-sonnet-4-5 application profiles
+claude_sonnet_4_5_app_profiles = set()
 
 # Initialize the model list.
 bedrock_model_list = list_bedrock_models()
@@ -459,6 +468,12 @@ class BedrockModel(BaseChatModel):
             "maxTokens": chat_request.max_tokens,
             "topP": chat_request.top_p,
         }
+
+        # Check if the model is a claude-sonnet-4-5 application profile
+        global claude_sonnet_4_5_app_profiles
+        if chat_request.model in claude_sonnet_4_5_app_profiles:
+            print(f"CLAUDE SONNET 4.5 APP PROFILE DETECTED: {chat_request.model}")
+            inference_config.pop("topP", None)
 
         if chat_request.stop is not None:
             stop = chat_request.stop
