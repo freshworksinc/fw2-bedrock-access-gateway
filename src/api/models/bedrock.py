@@ -4,6 +4,7 @@ import logging
 import re
 import time
 from abc import ABC
+from collections import defaultdict
 from typing import AsyncIterable, Iterable, Literal
 
 import boto3
@@ -91,55 +92,47 @@ def list_bedrock_models() -> dict:
         - Cross-Region Inference Profiles (if enabled via Env)
         - Application Inference Profiles (if enabled via Env)
     """
+    global claude_sonnet_4_5_app_profiles
     model_list = {}
     global claude_sonnet_4_5_app_profiles
     # Clear and store application profiles for claude-sonnet-4-5 as an exception
     claude_sonnet_4_5_app_profiles.clear()
     try:
         profile_list = []
-        app_profile_dict = {}
-        all_app_profiles = []
+        # Map foundation model_id -> set of application inference profile ARNs
+        app_profiles_by_model = defaultdict(set)
         
         if ENABLE_CROSS_REGION_INFERENCE:
             # List system defined inference profile IDs
-            response = bedrock_client.list_inference_profiles(maxResults=1000, typeEquals="SYSTEM_DEFINED")
-            profile_list = [p["inferenceProfileId"] for p in response["inferenceProfileSummaries"]]
+            paginator = bedrock_client.get_paginator('list_inference_profiles')
+            for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
+                profile_list.extend([p["inferenceProfileId"] for p in page["inferenceProfileSummaries"]])
 
         if ENABLE_APPLICATION_INFERENCE_PROFILES:
             # List application defined inference profile IDs and create mapping
-            response = bedrock_client.list_inference_profiles(maxResults=1000, typeEquals="APPLICATION")
-            
-            for profile in response["inferenceProfileSummaries"]:
-                try:
-                    profile_arn = profile.get("inferenceProfileArn")
-                    if not profile_arn:
+            paginator = bedrock_client.get_paginator('list_inference_profiles')
+            for page in paginator.paginate(maxResults=1000, typeEquals="APPLICATION"):
+                for profile in page["inferenceProfileSummaries"]:
+                    try:
+                        profile_arn = profile.get("inferenceProfileArn")
+                        if not profile_arn:
+                            continue
+                        
+                        # Process all models in the profile
+                        models = profile.get("models", [])
+                        for model in models:
+                            model_arn = model.get("modelArn", "")
+                            if model_arn:
+                                model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
+                                if model_id:
+                                    app_profiles_by_model[model_id].add(profile_arn)
+                                    # Store application profiles for claude-sonnet-4-5 as exception
+                                    if model_id == "anthropic.claude-sonnet-4-5-20250929-v1:0":
+                                        claude_sonnet_4_5_app_profiles.add(profile_arn)
+                    except Exception as e:
+                        logger.warning(f"Error processing application profile: {e}")
                         continue
                     
-                    # Add to list of all profiles
-                    all_app_profiles.append(profile_arn)
-                    
-                    # Process all models in the profile for model-to-profile mapping
-                    models = profile.get("models", [])
-                    for model in models:
-                        model_arn = model.get("modelArn", "")
-                        if model_arn:
-                            model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
-                            if model_id:
-                                if model_id not in app_profile_dict:
-                                    app_profile_dict[model_id] = []
-                                app_profile_dict[model_id].append(profile_arn)
-
-                                # Store application profiles for claude-sonnet-4-5 as exception
-                                if model_id == "anthropic.claude-sonnet-4-5-20250929-v1:0":
-                                    claude_sonnet_4_5_app_profiles.add(profile_arn)
-                except Exception as e:
-                    logger.warning(f"Error processing application profile: {e}")
-                    continue
-
-        # Add all application inference profiles to model list first
-        for profile_arn in all_app_profiles:
-            model_list[profile_arn] = {"modalities": ["TEXT", "IMAGE"]}
-
         # List foundation models, only cares about text outputs here.
         response = bedrock_client.list_foundation_models(byOutputModality="TEXT")
 
@@ -163,12 +156,14 @@ def list_bedrock_models() -> dict:
             if profile_id in profile_list:
                 model_list[profile_id] = {"modalities": input_modalities}
 
-            # # Add application inference profiles
-            # if model_id in app_profile_dict:
-            #     model_list[app_profile_dict[model_id]] = {"modalities": input_modalities}
-            # Update application inference profiles with correct modalities if we have foundation model info
-            if model_id in app_profile_dict:
-                for profile_arn in app_profile_dict[model_id]:
+            # Add global cross-region inference profiles
+            global_profile_id = "global." + model_id
+            if global_profile_id in profile_list:
+                model_list[global_profile_id] = {"modalities": input_modalities}
+
+            # Add application inference profiles (emit all profiles for this model)
+            if model_id in app_profiles_by_model:
+                for profile_arn in app_profiles_by_model[model_id]:
                     model_list[profile_arn] = {"modalities": input_modalities}
 
     except Exception as e:
@@ -179,6 +174,9 @@ def list_bedrock_models() -> dict:
         model_list[DEFAULT_MODEL] = {"modalities": ["TEXT", "IMAGE"]}
 
     return model_list
+
+# Global variable to store claude-sonnet-4-5 application profiles
+claude_sonnet_4_5_app_profiles = set()
 
 # Global variable to store claude-sonnet-4-5 application profiles
 claude_sonnet_4_5_app_profiles = set()
@@ -199,7 +197,9 @@ class BedrockModel(BaseChatModel):
         error = ""
         # Regex check for model_id ARN pattern
         arn_pattern = r"^.*application-inference-profile.*"
-        if not re.match(arn_pattern, chat_request.model):
+        arn_match = re.match(arn_pattern, chat_request.model)
+        
+        if not arn_match:
             error = f"model_id must match pattern: {arn_pattern}"
         # check if model is supported
         elif chat_request.model not in bedrock_model_list.keys():
@@ -276,6 +276,7 @@ class BedrockModel(BaseChatModel):
             response = await self._invoke_bedrock(chat_request, stream=True)
             message_id = self.generate_message_id()
             stream = response.get("stream")
+            self.think_emitted = False
             async for chunk in self._async_iterate(stream):
                 args = {"model_id": chat_request.model, "message_id": message_id, "chunk": chunk}
                 stream_response = self._create_response_stream(**args)
@@ -296,6 +297,7 @@ class BedrockModel(BaseChatModel):
 
             # return an [DONE] message at the end.
             yield self.stream_response_to_bytes()
+            self.think_emitted = False  # Cleanup
         except Exception as e:
             error_event = Error(error=ErrorMessage(message=str(e)))
             yield self.stream_response_to_bytes(error_event)
@@ -469,6 +471,11 @@ class BedrockModel(BaseChatModel):
             "topP": chat_request.top_p,
         }
 
+        # Claude Sonnet 4.5 doesn't support both temperature and topP
+        # Remove topP for this model
+        if "claude-sonnet-4-5" in chat_request.model.lower():
+            inference_config.pop("topP", None)
+        
         # Check if the model is a claude-sonnet-4-5 application profile
         global claude_sonnet_4_5_app_profiles
         if chat_request.model in claude_sonnet_4_5_app_profiles:
@@ -501,7 +508,7 @@ class BedrockModel(BaseChatModel):
             )
             inference_config["maxTokens"] = max_tokens
             # unset topP - Not supported
-            inference_config.pop("topP")
+            inference_config.pop("topP", None)
 
             args["additionalModelRequestFields"] = {
                 "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
@@ -527,8 +534,12 @@ class BedrockModel(BaseChatModel):
             args["toolConfig"] = tool_config
         # add Additional fields to enable extend thinking
         if chat_request.extra_body:
-            # reasoning_config will not be used 
+            # reasoning_config will not be used
             args["additionalModelRequestFields"] = chat_request.extra_body
+            # Extended thinking doesn't support both temperature and topP
+            # Remove topP to avoid validation error
+            if "thinking" in chat_request.extra_body:
+                inference_config.pop("topP", None)
         return args
 
     def _create_response(
@@ -574,6 +585,9 @@ class BedrockModel(BaseChatModel):
                     logger.warning(
                         "Unknown tag in message content " + ",".join(c.keys())
                     )
+            if message.reasoning_content:
+                message.content = f"<think>{message.reasoning_content}</think>{message.content}"
+                message.reasoning_content = None
 
         response = ChatResponse(
             id=message_id,
@@ -642,11 +656,19 @@ class BedrockModel(BaseChatModel):
                     content=delta["text"],
                 )
             elif "reasoningContent" in delta:
-                # ignore "signature" in the delta.
                 if "text" in delta["reasoningContent"]:
-                    message = ChatResponseMessage(
-                        reasoning_content=delta["reasoningContent"]["text"],
-                    )
+                    content = delta["reasoningContent"]["text"]
+                    if not self.think_emitted:
+                        # Port of "content_block_start" with "thinking"
+                        content = "<think>" + content
+                        self.think_emitted = True
+                    message = ChatResponseMessage(content=content)
+                elif "signature" in delta["reasoningContent"]:
+                    # Port of "signature_delta"
+                    if self.think_emitted:
+                        message = ChatResponseMessage(content="\n </think> \n\n")
+                    else:
+                        return None  # Ignore signature if no <think> started
             else:
                 # tool use
                 index = chunk["contentBlockDelta"]["contentBlockIndex"] - 1
